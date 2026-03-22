@@ -2,7 +2,7 @@
 
 A secure, custom shell utility for macOS that manages [openfortivpn](https://github.com/adrienverge/openfortivpn) connections with intelligent split-tunneling. Only CWRU traffic (`129.22.x.x`) goes through the VPN; everything else stays on your normal ISP at full speed, preserving your privacy and bandwidth.
 
-**Last updated: March 8, 2026**
+**Last updated: March 21, 2026**
 
 ## Prerequisites
 
