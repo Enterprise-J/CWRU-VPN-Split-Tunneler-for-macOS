@@ -44,6 +44,11 @@ _vpn_get_phys_info() {
             PHYS_IFACE=$(route -n get "$pg" 2>/dev/null | grep 'interface:' | awk '{print $2}')
         fi
     fi
+    if [[ "$PHYS_IFACE" =~ utun ]] || [[ "$PHYS_IFACE" =~ ppp ]] || [ -z "$GATEWAY" ]; then
+        echo "Error: Could not determine a non-VPN gateway."
+        return 1
+    fi
+    return 0
 }
 
 _vpn_flush_dns() {
@@ -90,10 +95,21 @@ _vpn_apply_network_config() {
             echo "search_order 1" | sudo /usr/bin/tee -a /etc/resolver/$domain > /dev/null
             i=0
         done
+        i=0
+        for server in "${DNS_SERVERS[@]}"; do
+            if [ $i -eq 0 ]; then
+                echo "nameserver $server" | sudo /usr/bin/tee /etc/resolver/22.129.in-addr.arpa > /dev/null
+            else
+                echo "nameserver $server" | sudo /usr/bin/tee -a /etc/resolver/22.129.in-addr.arpa > /dev/null
+            fi
+            ((i++))
+        done
     fi
     [ -z "$keepalive" ] && keepalive="pioneer.case.edu"
 
     sudo /sbin/route -n add -net 129.22.0.0/16 -interface "$iface" >/dev/null 2>&1
+
+    sudo /usr/sbin/networksetup -setv6off Wi-Fi 2>/dev/null
 
     echo "$keepalive"
 }
@@ -142,6 +158,22 @@ _vpn_stop_monitor() {
         rm -f "$VPN_TMP_DIR/monitor.pid"
     fi
 
+    if [ -f "$VPN_TMP_DIR/fallback.pid" ]; then
+        local pid=$(cat "$VPN_TMP_DIR/fallback.pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+        fi
+        rm -f "$VPN_TMP_DIR/fallback.pid"
+    fi
+
+    if [ -f "$VPN_TMP_DIR/route_mon.pid" ]; then
+        local pid=$(cat "$VPN_TMP_DIR/route_mon.pid")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null
+        fi
+        rm -f "$VPN_TMP_DIR/route_mon.pid"
+    fi
+
     if [ -f "$VPN_TMP_DIR/caffeinate.pid" ]; then
         local pid=$(cat "$VPN_TMP_DIR/caffeinate.pid")
         if kill -0 "$pid" 2>/dev/null; then
@@ -169,38 +201,80 @@ _vpn_monitor() {
     local CAFF_PID=$!
     echo $CAFF_PID > "$VPN_TMP_DIR/caffeinate.pid"
 
+    local FALLBACK_PID="" ROUTE_MON_PID=""
+
     _mon_cleanup() {
         kill $GUI_PID 2>/dev/null
         kill $CAFF_PID 2>/dev/null
-        rm -f "$VPN_TMP_DIR/monitor.pid" "$VPN_TMP_DIR/caffeinate.pid" "$VPN_TMP_DIR/gui.pid"
+        [ -n "$FALLBACK_PID" ] && kill $FALLBACK_PID 2>/dev/null
+        [ -n "$ROUTE_MON_PID" ] && kill $ROUTE_MON_PID 2>/dev/null
+        exec 3<&- 2>/dev/null
+        rm -f "$VPN_TMP_DIR/route_fifo"
+        rm -f "$VPN_TMP_DIR/monitor.pid" "$VPN_TMP_DIR/caffeinate.pid" "$VPN_TMP_DIR/gui.pid" "$VPN_TMP_DIR/fallback.pid" "$VPN_TMP_DIR/route_mon.pid"
     }
     trap _mon_cleanup EXIT
 
-    sleep 5
-    while true; do
-        if [ -n "$KEEPALIVE_IP" ]; then
-            ping -c 1 -W 2 "$KEEPALIVE_IP" >/dev/null 2>&1 &
-        fi
+    _mon_check_and_repair() {
         if ! ifconfig | grep -q "$TARGET_IP"; then
             osascript -e 'display alert "CWRU VPN" message "VPN Connection Dropped." as critical' >/dev/null 2>&1 &
-            _mon_cleanup
-            trap - EXIT
-            dvpn
-            exit 0
+            touch "$VPN_TMP_DIR/vpn_dropped"
+            return 1
         fi
         if ! netstat -nrf inet | grep -q "129\.22.*$VPN_IFACE"; then
             local GATEWAY PHYS_IFACE
-            _vpn_get_phys_info
-            if [ -n "$GATEWAY" ] && [ -n "$VPN_IFACE" ]; then
+            if _vpn_get_phys_info 2>/dev/null && [ -n "$GATEWAY" ] && [ -n "$VPN_IFACE" ]; then
                 sudo /sbin/route -n delete -net 0.0.0.0/1 >/dev/null 2>&1
                 sudo /sbin/route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
                 sudo /sbin/route -n add -net 0.0.0.0/1 "$GATEWAY" >/dev/null 2>&1
                 sudo /sbin/route -n add -net 128.0.0.0/1 "$GATEWAY" >/dev/null 2>&1
                 sudo /sbin/route -n add -net 129.22.0.0/16 -interface "$VPN_IFACE" >/dev/null 2>&1
                 echo "$GATEWAY" > "$VPN_TMP_DIR/gateway"
+                _vpn_flush_dns
             fi
         fi
-        sleep 5 & wait $!
+        return 0
+    }
+
+    sleep 5
+
+    {
+        while true; do
+            if [ -n "$KEEPALIVE_IP" ]; then
+                ping -c 1 -W 2 "$KEEPALIVE_IP" >/dev/null 2>&1 &
+            fi
+            _mon_check_and_repair || break
+            sleep 30 & wait $!
+        done
+    } &
+    FALLBACK_PID=$!
+    echo $FALLBACK_PID > "$VPN_TMP_DIR/fallback.pid"
+
+    mkfifo "$VPN_TMP_DIR/route_fifo" 2>/dev/null
+    route -n monitor > "$VPN_TMP_DIR/route_fifo" 2>/dev/null &
+    ROUTE_MON_PID=$!
+    echo $ROUTE_MON_PID > "$VPN_TMP_DIR/route_mon.pid"
+
+    exec 3< "$VPN_TMP_DIR/route_fifo"
+
+    while true; do
+        if [ -f "$VPN_TMP_DIR/vpn_dropped" ]; then
+            rm -f "$VPN_TMP_DIR/vpn_dropped"
+            exec 3<&-
+            _mon_cleanup
+            trap - EXIT
+            dvpn
+            return 0
+        fi
+        if read -r -t 1 line <&3 2>/dev/null; then
+            _mon_check_and_repair || {
+                rm -f "$VPN_TMP_DIR/vpn_dropped"
+                exec 3<&-
+                _mon_cleanup
+                trap - EXIT
+                dvpn
+                return 0
+            }
+        fi
     done
 }
 vpn() {
@@ -219,7 +293,9 @@ vpn() {
                 TMP_SUDOERS=$(mktemp "${TMPDIR:-/tmp}/vpn_sudoers.XXXXXX")
 
                 cat <<EOF > "$TMP_SUDOERS"
-$(whoami) ALL=(ALL) NOPASSWD: /sbin/route
+$(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n add *
+$(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n delete *
+$(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n flush
 $(whoami) ALL=(ALL) NOPASSWD: $OFV_PATH
 $(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/dscacheutil -flushcache
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/killall -HUP mDNSResponder
@@ -229,7 +305,11 @@ $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/resolver/case.edu
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee -a /etc/resolver/case.edu
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/resolver/cwru.edu
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee -a /etc/resolver/cwru.edu
-$(whoami) ALL=(ALL) NOPASSWD: /bin/rm -f /etc/resolver/case.edu /etc/resolver/cwru.edu
+$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/resolver/22.129.in-addr.arpa
+$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee -a /etc/resolver/22.129.in-addr.arpa
+$(whoami) ALL=(ALL) NOPASSWD: /bin/rm -f /etc/resolver/case.edu /etc/resolver/cwru.edu /etc/resolver/22.129.in-addr.arpa
+$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6off Wi-Fi
+$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6automatic Wi-Fi
 EOF
 
                 if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
@@ -253,7 +333,9 @@ EOF
     local VPN_IP VPN_IFACE GATEWAY PHYS_IFACE VPN_PASS VPN_USER TOTP
 
     if _vpn_get_info; then
-        _vpn_get_phys_info
+        if ! _vpn_get_phys_info; then
+            return 1
+        fi
         [ -z "$GATEWAY" ] || [ -z "$VPN_IFACE" ] && return 1
         echo "$GATEWAY" > "$VPN_TMP_DIR/gateway"
         _vpn_stop_monitor
@@ -279,6 +361,7 @@ EOF
         _vpn_flush_dns
         _vpn_compile_menu_helper
         ( _vpn_monitor "$VPN_IP" "$KEEPALIVE_IP" "$VPN_IFACE" & echo $! > "$VPN_TMP_DIR/monitor.pid" )
+        unset VPN_PASS VPN_USER TOTP
         return 0
     fi
 
@@ -308,8 +391,12 @@ EOF
         
         set +m 2>/dev/null
         {
+            local _clip_start=$(date +%s)
             while true; do
                 sleep 0.2
+                if (( $(date +%s) - _clip_start >= 120 )); then
+                    break
+                fi
                 local CURRENT_CLIP=$(pbpaste 2>/dev/null)
                 if [ "$CURRENT_CLIP" != "$INITIAL_CLIP" ]; then
                     local CLEAN_CLIP=$(echo "$CURRENT_CLIP" | tr -d '\n\r ')
@@ -321,6 +408,7 @@ EOF
                     INITIAL_CLIP="$CURRENT_CLIP"
                 fi
             done
+            unset INITIAL_CLIP CURRENT_CLIP CLEAN_CLIP
         } >/dev/null 2>&1 </dev/null &!
         local CLIP_PID=$!
         set -m 2>/dev/null
@@ -352,8 +440,6 @@ EOF
     VPN_CONF=$(mktemp "${TMPDIR:-/tmp}/vpn_conf.XXXXXX")
     chmod 600 "$VPN_CONF"
 
-    trap 'rm -f "$VPN_CONF"; dvpn >/dev/null 2>&1' EXIT INT TERM
-
     cat > "$VPN_CONF" <<CONFEOF
 host = vpn2.case.edu
 port = 443
@@ -362,6 +448,8 @@ password = $VPN_PASS
 set-dns = 0
 set-routes = 0
 CONFEOF
+
+    trap 'rm -f "$VPN_CONF"; dvpn >/dev/null 2>&1' EXIT INT TERM
 
     local OFV_EXEC
     OFV_EXEC=$(command -v openfortivpn 2>/dev/null)
@@ -376,6 +464,7 @@ CONFEOF
     while ! _vpn_get_info; do
         if ! kill -0 "$OFV_PID" 2>/dev/null && ! pgrep -q openfortivpn; then
             echo "Authentication failed."
+            unset VPN_PASS VPN_USER TOTP
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -383,6 +472,7 @@ CONFEOF
         fi
         if grep -qE "ERROR:" "$VPN_TMP_DIR/openfortivpn.log" 2>/dev/null; then
             echo "Authentication failed."
+            unset VPN_PASS VPN_USER TOTP
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -390,6 +480,7 @@ CONFEOF
         fi
         if (( $(date +%s) - start_time >= 60 )); then
             echo "Connection timed out."
+            unset VPN_PASS VPN_USER TOTP
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -401,8 +492,14 @@ CONFEOF
     rm -f "$VPN_CONF"
     trap - EXIT INT TERM
 
-    _vpn_get_phys_info
-    [ -z "$GATEWAY" ] || [ -z "$VPN_IFACE" ] && return 1
+    if ! _vpn_get_phys_info; then
+        unset VPN_PASS VPN_USER TOTP
+        return 1
+    fi
+    if [ -z "$GATEWAY" ] || [ -z "$VPN_IFACE" ]; then
+        unset VPN_PASS VPN_USER TOTP
+        return 1
+    fi
     echo "$GATEWAY" > "$VPN_TMP_DIR/gateway"
 
     local KEEPALIVE_IP
@@ -411,6 +508,7 @@ CONFEOF
     _vpn_flush_dns
     _vpn_compile_menu_helper
     ( _vpn_monitor "$VPN_IP" "$KEEPALIVE_IP" "$VPN_IFACE" & echo $! > "$VPN_TMP_DIR/monitor.pid" )
+    unset VPN_PASS VPN_USER TOTP
     return 0
 }
 
@@ -420,8 +518,11 @@ dvpn() {
     if ! _vpn_get_info && ! pgrep -q openfortivpn \
         && [ ! -f /etc/resolver/case.edu ] \
         && [ ! -f /etc/resolver/cwru.edu ] \
+        && [ ! -f /etc/resolver/22.129.in-addr.arpa ] \
         && [ ! -f "$VPN_TMP_DIR/gateway" ] \
         && [ ! -f "$VPN_TMP_DIR/monitor.pid" ] \
+        && [ ! -f "$VPN_TMP_DIR/fallback.pid" ] \
+        && [ ! -f "$VPN_TMP_DIR/route_mon.pid" ] \
         && [ ! -f "$VPN_TMP_DIR/caffeinate.pid" ]; then
         return 0
     fi
@@ -429,12 +530,12 @@ dvpn() {
     _vpn_stop_monitor
 
     local GATEWAY PHYS_IFACE
-    _vpn_get_phys_info
+    _vpn_get_phys_info 2>/dev/null
     if [ -z "$GATEWAY" ] && [ -f "$VPN_TMP_DIR/gateway" ]; then
         GATEWAY=$(cat "$VPN_TMP_DIR/gateway")
     fi
 
-    sudo /bin/rm -f /etc/resolver/case.edu /etc/resolver/cwru.edu 2>/dev/null
+    sudo /bin/rm -f /etc/resolver/case.edu /etc/resolver/cwru.edu /etc/resolver/22.129.in-addr.arpa 2>/dev/null
 
     local VPN_IP VPN_IFACE P2P_IP
     if _vpn_get_info; then
@@ -462,6 +563,8 @@ dvpn() {
     if [ -f "$VPN_TMP_DIR/server_ips" ]; then
         while read -r ip; do sudo /sbin/route -n delete -host "$ip" >/dev/null 2>&1; done < "$VPN_TMP_DIR/server_ips"
     fi
+
+    sudo /usr/sbin/networksetup -setv6automatic Wi-Fi 2>/dev/null
 
     _vpn_flush_dns
     _vpn_cleanup_tmp_dir
