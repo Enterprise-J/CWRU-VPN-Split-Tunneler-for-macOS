@@ -1,19 +1,19 @@
 # CWRU VPN Split-Tunneler for macOS
 
-A secure, custom shell utility for macOS that manages [openfortivpn](https://github.com/adrienverge/openfortivpn) connections with intelligent split-tunneling. Only CWRU traffic (`129.22.x.x`) goes through the VPN; everything else stays on your normal ISP at full speed, preserving your privacy and bandwidth.
+A shell utility for macOS that manages [openfortivpn](https://github.com/adrienverge/openfortivpn) connections with split-tunneling. Only CWRU traffic (`129.22.0.0/16`) goes through the VPN; everything else stays on your normal ISP at full speed.
 
 **Last updated: March 21, 2026**
 
 ## Prerequisites
 
-- **macOS** and **Z Shell (Zsh)** (use `networksetup`, `security`, `scutil`, `swiftc`, `pbpaste`, and `&!`)
+- **macOS** and **Zsh**
 - **openfortivpn**: `brew install openfortivpn`
-- **Sudo Privileges** — [enabling TouchID for sudo](https://dev.to/siddhantkcode/enable-touch-id-authentication-for-sudo-on-macos-sonoma-14x-4d28) is highly recommended.
+- **Sudo privileges** — [enabling TouchID for sudo](https://dev.to/siddhantkcode/enable-touch-id-authentication-for-sudo-on-macos-sonoma-14x-4d28) is highly recommended.
 
 ## Installation & Setup
 
 1. **Save the script** somewhere permanent (e.g., `~/scripts/split_tunnel.sh`).
-2. **Add the following line** to your `~/.zshrc`:
+2. **Source it** in your `~/.zshrc`:
     ```bash
     source ~/scripts/split_tunnel.sh
     ```
@@ -21,39 +21,54 @@ A secure, custom shell utility for macOS that manages [openfortivpn](https://git
     ```bash
     source ~/.zshrc
     ```
-4. **Configure Sudoers**: The background VPN monitor needs permission to manage routing without pausing to ask for a password. Run the built-in setup command to generate the necessary security rules:
+4. **Install sudoers rules**: The background monitor needs passwordless sudo for routing commands. Run the built-in setup:
     ```bash
     vpn --setup
     ```
-5. **(Optional) Keychain credentials**: Ensure your CWRU credentials are saved in the macOS Keychain under the label **`CaseWireless`**. If you connect to the campus WiFi (CaseWireless) with your CWRU Network ID, this is already done automatically.
+5. **(Optional) Keychain credentials**: Ensure your CWRU credentials are saved in the macOS Keychain under the label **`CaseWireless`**. If you connect to campus Wi-Fi (CaseWireless) with your CWRU Network ID, this is already done automatically.
 
 ## Usage
 
-> **Note:** There is no `bash` support; this utility is for `zsh` only.
+> **Note:** This utility requires Zsh. Bash is not supported.
 
 | Command | Description |
 |---------|-------------|
-| `vpn` | Connect to the VPN in secure split-tunnel mode. |
-| `dvpn` | Disconnect, gracefully clean up routes, and restore defaults. |
-| `vpn --setup` | Output the required `/etc/sudoers.d/` rules for installation. |
+| `vpn` | Connect to the VPN in split-tunnel mode. |
+| `dvpn` | Disconnect and restore default routing. |
+| `vpn --setup` | Install the required passwordless sudo rules to `/etc/sudoers.d/vpn`. |
 
-Every new connection requires a TOTP verification. At the TOTP prompt, you have a few options:
-- **Auto-read clipboard**: Simply copy a 6-digit code, and the script will automatically read it.
-- **Manual entry**: Type your TOTP code manually and press **Enter**.
-- **Duo Push**: Press **Enter** without typing anything to receive a Duo Push.
+Every new connection requires TOTP verification. At the prompt:
+- **Auto-read clipboard**: Copy a 6-digit code and the script picks it up automatically (120s timeout).
+- **Manual entry**: Type the code and press **Enter**.
+- **Duo Push**: Press **Enter** without typing anything.
 
-Your credentials will auto-fill securely from Keychain; if they don’t appear, the script will prompt you to enter your Network ID and passphrase manually.
+Credentials auto-fill from Keychain. If not found, you will be prompted to enter them manually.
 
 ## How It Works
 
 ### Routing
-The script launches openfortivpn with `--set-routes=0` and manages all routing locally. Only traffic destined for `129.22.0.0/16` is routed through the VPN interface. All other web traffic bypasses the VPN entirely.
 
-### Privacy
-Scoped macOS DNS resolvers (`/etc/resolver/case.edu` and `cwru.edu`) are generated securely. This ensures that **only** CWRU domain queries go to university nameservers. All other DNS queries use your local ISP, keeping your personal browsing invisible to the university network.
+The script launches openfortivpn with `set-routes=0` and `set-dns=0`, taking full control of routing and DNS. Only traffic destined for `129.22.0.0/16` is routed through the VPN interface. All other traffic bypasses the VPN entirely. IPv6 is disabled on Wi-Fi while the VPN is active to prevent tunnel bypass.
+
+A background monitor watches for route changes using event-driven `route -n monitor` (with a periodic fallback check) and automatically repairs routing if macOS resets it (e.g., after a network switch).
+
+### DNS
+
+Scoped macOS resolvers are created for `case.edu`, `cwru.edu`, and `22.129.in-addr.arpa` (reverse PTR), directing CWRU-related DNS queries to university nameservers. All other DNS queries use your default resolver.
 
 ### Security
-Unlike default `openfortivpn` implementations, this script never exposes your password to the system process list. Credentials are dynamically written to a strictly permissioned (`chmod 600`) temporary file, passed to the client, and immediately destroyed.
+
+- Credentials are read from macOS Keychain and written to a `chmod 600` temporary file that is destroyed immediately after connection, with trap-based cleanup on failure.
+- All credential variables (`VPN_PASS`, `VPN_USER`, `TOTP`) are explicitly unset from shell memory after use.
+- The VPN connection is protected by standard TLS certificate validation against the system trust store.
+- Route integrity is continuously monitored and auto-repaired.
+
+## Known Limitations
+
+- **DNS multi-path leakage**: Due to macOS's multi-path DNS resolution, `case.edu` forward queries may also be sent to your default DNS resolver simultaneously. Your ISP can see that you queried a CWRU hostname, but cannot see the resolved IP (it receives NXDOMAIN) or any subsequent traffic (encrypted through the VPN tunnel).
+- **Sudoers scope**: The sudoers rules grant broad NOPASSWD access to `/sbin/route -n add *` and `/sbin/route -n delete *`. macOS sudoers does not support finer-grained argument matching for `route`.
+- **Clipboard monitoring**: The TOTP clipboard monitor polls `pbpaste` for up to 120 seconds. During this window, clipboard contents are read (but not stored or transmitted) to detect 6-digit codes.
+- **Password on disk**: `openfortivpn` requires a config file for credentials. The password is briefly written to a `chmod 600` temp file and deleted immediately after use. This is a limitation of `openfortivpn` not supporting stdin-based password input.
 
 ---
 
