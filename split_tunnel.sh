@@ -1,4 +1,7 @@
 VPN_TMP_DIR_FILE="$HOME/.vpn_tmp_dir"
+VPN_KEYCHAIN_LABEL="CaseWireless"
+VPN_TOTP_KEYCHAIN_SERVICE="CaseWireless TOTP"
+VPN_TOTP_KEYCHAIN_LABEL="CaseWireless TOTP"
 
 _vpn_ensure_tmp_dir() {
     if [ -n "$VPN_TMP_DIR" ] && [ -d "$VPN_TMP_DIR" ]; then
@@ -15,10 +18,117 @@ _vpn_ensure_tmp_dir() {
 
 _vpn_cleanup_tmp_dir() {
     if [ -n "$VPN_TMP_DIR" ] && [ -d "$VPN_TMP_DIR" ]; then
-        rm -rf "$VPN_TMP_DIR"
+        local tmp_root=${TMPDIR:-/tmp}
+        tmp_root=${tmp_root%/}
+        case "$VPN_TMP_DIR" in
+            "$tmp_root"/vpn_*|/tmp/vpn_*|/var/folders/*/vpn_*)
+                rm -rf "$VPN_TMP_DIR"
+                ;;
+            *)
+                echo "Warning: VPN_TMP_DIR '$VPN_TMP_DIR' does not match expected pattern. Skipping cleanup."
+                ;;
+        esac
     fi
     rm -f "$VPN_TMP_DIR_FILE"
     unset VPN_TMP_DIR
+}
+
+_vpn_get_saved_user() {
+    local saved_user
+    saved_user=$(security find-internet-password -l "$VPN_KEYCHAIN_LABEL" 2>/dev/null | awk -F'=' '/"acct"<blob>/ {print $2}' | tr -d '"')
+    if [ -n "$saved_user" ]; then
+        printf '%s' "$saved_user"
+        return 0
+    fi
+
+    saved_user=$(security find-generic-password -l "$VPN_KEYCHAIN_LABEL" 2>/dev/null | awk -F'=' '/"acct"<blob>/ {print $2}' | tr -d '"')
+    [ -n "$saved_user" ] || return 1
+    printf '%s' "$saved_user"
+}
+
+_vpn_get_totp_secret() {
+    local totp_secret
+    totp_secret=$(security find-generic-password -s "$VPN_TOTP_KEYCHAIN_SERVICE" -w 2>/dev/null)
+    if [ -n "$totp_secret" ]; then
+        printf '%s' "$totp_secret"
+        return 0
+    fi
+
+    totp_secret=$(security find-generic-password -l "$VPN_TOTP_KEYCHAIN_LABEL" -w 2>/dev/null)
+    [ -n "$totp_secret" ] || return 1
+    printf '%s' "$totp_secret"
+}
+
+_vpn_store_totp_secret() {
+    local totp_secret=$1
+    local account_name=$2
+
+    [ -n "$totp_secret" ] || return 1
+    [ -n "$account_name" ] || account_name="${USER:-vpn}"
+
+    security add-generic-password \
+        -U \
+        -a "$account_name" \
+        -s "$VPN_TOTP_KEYCHAIN_SERVICE" \
+        -l "$VPN_TOTP_KEYCHAIN_LABEL" \
+        -w "$totp_secret" >/dev/null 2>&1
+}
+
+_vpn_generate_totp() {
+    local totp_secret=$1
+    local py_exec
+    local code
+
+    [ -n "$totp_secret" ] || return 1
+
+    py_exec=$(command -v python3 2>/dev/null)
+    [ -n "$py_exec" ] || return 1
+
+    code=$(printf '%s' "$totp_secret" | "$py_exec" -c '
+import base64
+import hashlib
+import hmac
+import struct
+import sys
+import time
+import urllib.parse
+
+raw = sys.stdin.read().strip()
+if not raw:
+    raise SystemExit(1)
+
+if raw.startswith("otpauth://"):
+    parsed = urllib.parse.urlparse(raw)
+    query = urllib.parse.parse_qs(parsed.query)
+    raw = query.get("secret", [""])[0].strip()
+    digits = int(query.get("digits", ["6"])[0])
+    period = int(query.get("period", ["30"])[0])
+    algorithm = query.get("algorithm", ["SHA1"])[0].upper()
+else:
+    digits = 6
+    period = 30
+    algorithm = "SHA1"
+
+if not raw:
+    raise SystemExit(1)
+
+normalized = raw.replace(" ", "").replace("-", "").upper()
+normalized += "=" * (-len(normalized) % 8)
+key = base64.b32decode(normalized, casefold=True)
+digestmod = getattr(hashlib, algorithm.lower(), None)
+if digestmod is None:
+    raise SystemExit(1)
+
+counter = int(time.time()) // period
+msg = struct.pack(">Q", counter)
+digest = hmac.new(key, msg, digestmod).digest()
+offset = digest[-1] & 0x0F
+code = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % (10 ** digits)
+print(f"{code:0{digits}d}")
+' 2>/dev/null)
+
+    [ -n "$code" ] || return 1
+    printf '%s' "$code"
 }
 
 _vpn_get_info() {
@@ -56,8 +166,17 @@ _vpn_flush_dns() {
     sudo /usr/bin/killall -HUP mDNSResponder 2>/dev/null
 }
 
+_vpn_get_network_service() {
+    local iface=$1
+    /usr/sbin/networksetup -listallhardwareports 2>/dev/null | awk -v dev="$iface" '
+        /Hardware Port:/ { port=$0; sub(/Hardware Port: /, "", port) }
+        /Device: / && $2 == dev { print port; exit }
+    '
+}
+
 _vpn_apply_network_config() {
-    local gw=$1 iface=$2
+    local gw=$1 iface=$2 phys_iface=$3
+    local network_service
 
     _vpn_ensure_tmp_dir
 
@@ -109,7 +228,12 @@ _vpn_apply_network_config() {
 
     sudo /sbin/route -n add -net 129.22.0.0/16 -interface "$iface" >/dev/null 2>&1
 
-    sudo /usr/sbin/networksetup -setv6off Wi-Fi 2>/dev/null
+    network_service=$(_vpn_get_network_service "$phys_iface")
+    if [ -z "$network_service" ]; then
+        network_service="Wi-Fi"
+        echo "Warning: Could not determine active network service for interface '$phys_iface'. Falling back to Wi-Fi." >&2
+    fi
+    sudo /usr/sbin/networksetup -setv6off "$network_service" 2>/dev/null
 
     echo "$keepalive"
 }
@@ -286,6 +410,7 @@ vpn() {
                 ;;
             --setup)
                 local OFV_PATH
+                local SETUP_VPN_USER TOTP_SECRET
                 OFV_PATH=$(command -v openfortivpn 2>/dev/null)
                 [ -z "$OFV_PATH" ] && [ -f /opt/homebrew/bin/openfortivpn ] && OFV_PATH="/opt/homebrew/bin/openfortivpn"
                 [ -z "$OFV_PATH" ] && OFV_PATH="/usr/local/bin/openfortivpn"
@@ -295,7 +420,6 @@ vpn() {
                 cat <<EOF > "$TMP_SUDOERS"
 $(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n add *
 $(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n delete *
-$(whoami) ALL=(ALL) NOPASSWD: /sbin/route -n flush
 $(whoami) ALL=(ALL) NOPASSWD: $OFV_PATH
 $(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/dscacheutil -flushcache
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/killall -HUP mDNSResponder
@@ -308,8 +432,8 @@ $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee -a /etc/resolver/cwru.edu
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee /etc/resolver/22.129.in-addr.arpa
 $(whoami) ALL=(ALL) NOPASSWD: /usr/bin/tee -a /etc/resolver/22.129.in-addr.arpa
 $(whoami) ALL=(ALL) NOPASSWD: /bin/rm -f /etc/resolver/case.edu /etc/resolver/cwru.edu /etc/resolver/22.129.in-addr.arpa
-$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6off Wi-Fi
-$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6automatic Wi-Fi
+$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6off *
+$(whoami) ALL=(ALL) NOPASSWD: /usr/sbin/networksetup -setv6automatic *
 EOF
 
                 if sudo visudo -c -f "$TMP_SUDOERS" >/dev/null 2>&1; then
@@ -318,8 +442,33 @@ EOF
                     sudo chmod 440 /etc/sudoers.d/vpn
                 else
                     echo "Error: Generated sudoers rules failed validation. Setup aborted."
+                    rm -f "$TMP_SUDOERS"
+                    return 1
                 fi
                 rm -f "$TMP_SUDOERS"
+
+                if [ -t 0 ]; then
+                    SETUP_VPN_USER=$(_vpn_get_saved_user 2>/dev/null)
+                    [ -n "$SETUP_VPN_USER" ] || SETUP_VPN_USER="${USER:-vpn}"
+
+                    printf "TOTP secret (optional; paste otpauth://... or raw base32, Enter to skip): "
+                    read -r TOTP_SECRET
+                    TOTP_SECRET=$(printf '%s' "$TOTP_SECRET" | tr -d '\r')
+
+                    if [ -n "$TOTP_SECRET" ]; then
+                        if _vpn_generate_totp "$TOTP_SECRET" >/dev/null 2>&1; then
+                            if _vpn_store_totp_secret "$TOTP_SECRET" "$SETUP_VPN_USER"; then
+                                echo "Stored TOTP secret in macOS Keychain for runtime code generation."
+                            else
+                                echo "Warning: Could not store the TOTP secret in macOS Keychain."
+                            fi
+                        else
+                            echo "Error: Invalid TOTP secret. Not saved."
+                        fi
+                    else
+                        echo "Skipped TOTP Keychain update. Run 'vpn --setup' later if you want to add it."
+                    fi
+                fi
                 return 0
                 ;;
             *) return 1 ;;
@@ -327,10 +476,13 @@ EOF
     done
 
     sudo -v 2>/dev/null || return 1
+    if ! sudo -n -l /sbin/route -n add 0.0.0.0 0.0.0.0 >/dev/null 2>&1; then
+        echo "Warning: sudoers rules not installed. Run 'vpn --setup' first. Background route repair may fail silently."
+    fi
 
     _vpn_ensure_tmp_dir
 
-    local VPN_IP VPN_IFACE GATEWAY PHYS_IFACE VPN_PASS VPN_USER TOTP
+    local VPN_IP VPN_IFACE GATEWAY PHYS_IFACE VPN_PASS VPN_USER TOTP TOTP_SECRET
 
     if _vpn_get_info; then
         if ! _vpn_get_phys_info; then
@@ -356,7 +508,7 @@ EOF
         done
 
         local KEEPALIVE_IP
-        KEEPALIVE_IP=$(_vpn_apply_network_config "$GATEWAY" "$VPN_IFACE")
+        KEEPALIVE_IP=$(_vpn_apply_network_config "$GATEWAY" "$VPN_IFACE" "$PHYS_IFACE")
 
         _vpn_flush_dns
         _vpn_compile_menu_helper
@@ -365,11 +517,11 @@ EOF
         return 0
     fi
 
-    VPN_PASS=$(security find-internet-password -l "CaseWireless" -w 2>/dev/null)
-    VPN_USER=$(security find-internet-password -l "CaseWireless" 2>/dev/null | awk -F'=' '/"acct"<blob>/ {print $2}' | tr -d '"')
+    VPN_PASS=$(security find-internet-password -l "$VPN_KEYCHAIN_LABEL" -w 2>/dev/null)
+    VPN_USER=$(_vpn_get_saved_user 2>/dev/null)
     if [ -z "$VPN_PASS" ] || [ -z "$VPN_USER" ]; then
-        VPN_PASS=$(security find-generic-password -l "CaseWireless" -w 2>/dev/null)
-        VPN_USER=$(security find-generic-password -l "CaseWireless" 2>/dev/null | awk -F'=' '/"acct"<blob>/ {print $2}' | tr -d '"')
+        VPN_PASS=$(security find-generic-password -l "$VPN_KEYCHAIN_LABEL" -w 2>/dev/null)
+        VPN_USER=$(_vpn_get_saved_user 2>/dev/null)
     fi
 
     if [ -z "$VPN_USER" ] || [ -z "$VPN_PASS" ]; then
@@ -380,7 +532,15 @@ EOF
         echo
     fi
 
-    if [ -t 0 ]; then
+    TOTP_SECRET=$(_vpn_get_totp_secret 2>/dev/null)
+    if [ -n "$TOTP_SECRET" ]; then
+        TOTP=$(_vpn_generate_totp "$TOTP_SECRET" 2>/dev/null)
+        if [ -z "$TOTP" ]; then
+            echo "Stored TOTP secret could not be used. Falling back to Duo Push or manual entry."
+        fi
+    fi
+
+    if [ -t 0 ] && [ -z "$TOTP" ]; then
         printf "TOTP (Enter for Duo Push, type, or auto-read clipboard): "
         
         local INITIAL_CLIP=$(pbpaste 2>/dev/null)
@@ -431,8 +591,9 @@ EOF
             TOTP=$(echo "$MAN_TOTP" | tr -d '\n\r ')
         fi
         
-        [ -n "$TOTP" ] && VPN_PASS="${VPN_PASS},${TOTP}"
     fi
+
+    [ -n "$TOTP" ] && VPN_PASS="${VPN_PASS},${TOTP}"
 
     sudo /usr/bin/killall openfortivpn 2>/dev/null
 
@@ -464,7 +625,7 @@ CONFEOF
     while ! _vpn_get_info; do
         if ! kill -0 "$OFV_PID" 2>/dev/null && ! pgrep -q openfortivpn; then
             echo "Authentication failed."
-            unset VPN_PASS VPN_USER TOTP
+            unset VPN_PASS VPN_USER TOTP TOTP_SECRET
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -472,7 +633,7 @@ CONFEOF
         fi
         if grep -qE "ERROR:" "$VPN_TMP_DIR/openfortivpn.log" 2>/dev/null; then
             echo "Authentication failed."
-            unset VPN_PASS VPN_USER TOTP
+            unset VPN_PASS VPN_USER TOTP TOTP_SECRET
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -480,7 +641,7 @@ CONFEOF
         fi
         if (( $(date +%s) - start_time >= 60 )); then
             echo "Connection timed out."
-            unset VPN_PASS VPN_USER TOTP
+            unset VPN_PASS VPN_USER TOTP TOTP_SECRET
             rm -f "$VPN_CONF"
             trap - EXIT INT TERM
             dvpn
@@ -493,22 +654,22 @@ CONFEOF
     trap - EXIT INT TERM
 
     if ! _vpn_get_phys_info; then
-        unset VPN_PASS VPN_USER TOTP
+        unset VPN_PASS VPN_USER TOTP TOTP_SECRET
         return 1
     fi
     if [ -z "$GATEWAY" ] || [ -z "$VPN_IFACE" ]; then
-        unset VPN_PASS VPN_USER TOTP
+        unset VPN_PASS VPN_USER TOTP TOTP_SECRET
         return 1
     fi
     echo "$GATEWAY" > "$VPN_TMP_DIR/gateway"
 
     local KEEPALIVE_IP
-    KEEPALIVE_IP=$(_vpn_apply_network_config "$GATEWAY" "$VPN_IFACE")
+    KEEPALIVE_IP=$(_vpn_apply_network_config "$GATEWAY" "$VPN_IFACE" "$PHYS_IFACE")
 
     _vpn_flush_dns
     _vpn_compile_menu_helper
     ( _vpn_monitor "$VPN_IP" "$KEEPALIVE_IP" "$VPN_IFACE" & echo $! > "$VPN_TMP_DIR/monitor.pid" )
-    unset VPN_PASS VPN_USER TOTP
+    unset VPN_PASS VPN_USER TOTP TOTP_SECRET
     return 0
 }
 
@@ -564,7 +725,13 @@ dvpn() {
         while read -r ip; do sudo /sbin/route -n delete -host "$ip" >/dev/null 2>&1; done < "$VPN_TMP_DIR/server_ips"
     fi
 
-    sudo /usr/sbin/networksetup -setv6automatic Wi-Fi 2>/dev/null
+    local NETWORK_SERVICE
+    NETWORK_SERVICE=$(_vpn_get_network_service "$PHYS_IFACE")
+    if [ -z "$NETWORK_SERVICE" ]; then
+        NETWORK_SERVICE="Wi-Fi"
+        echo "Warning: Could not determine active network service for interface '$PHYS_IFACE'. Falling back to Wi-Fi." >&2
+    fi
+    sudo /usr/sbin/networksetup -setv6automatic "$NETWORK_SERVICE" 2>/dev/null
 
     _vpn_flush_dns
     _vpn_cleanup_tmp_dir
@@ -572,7 +739,11 @@ dvpn() {
     set +m 2>/dev/null
     {
         if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && ! ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
-            sudo /sbin/route -n flush >/dev/null 2>&1
+            sudo /sbin/route -n delete -net 0.0.0.0/1 >/dev/null 2>&1
+            sudo /sbin/route -n delete -net 128.0.0.0/1 >/dev/null 2>&1
+            sudo /sbin/route -n delete -net 129.22.0.0/16 >/dev/null 2>&1
+            [ -n "$GATEWAY" ] && sudo /sbin/route -n delete default >/dev/null 2>&1
+            [ -n "$GATEWAY" ] && sudo /sbin/route -n add default "$GATEWAY" >/dev/null 2>&1
             sleep 2
             if ! ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1 && ! ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && ! ping -c 1 -W 2 223.5.5.5 >/dev/null 2>&1; then
                 osascript -e 'display alert "CWRU VPN" message "Network routing could not be automatically restored. Please manually toggle Wi-Fi." as critical' >/dev/null 2>&1 &
